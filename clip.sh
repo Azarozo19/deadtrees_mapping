@@ -1,9 +1,9 @@
 ##!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="/rvt_mount/deadwood_clip_DE/data"
-SHAPEFILE="/rvt_mount/3DTests/data/harm_data/shp_germany_border.shp"
-OUTPUT_DIR="/rvt_mount/deadwood_clip_DE/output"
+INPUT_DIR="/drive_mount/general_data/deadwood"
+SHAPEFILE="/drive_mount/general_data/germany/2024_v1_0.shp"
+OUTPUT_DIR="/drive_mount/general_data/deadwood/output"
 CUTLINE_LAYER="shp_germany_border"
 NO_DATA="0"
 
