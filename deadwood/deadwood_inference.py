@@ -66,6 +66,7 @@ class DeadwoodInference:
         vrt_src = image_reprojector(
             input_tif, min_res=self.config["deadwood_minimum_inference_resolution"]
         )
+        inference_crs = vrt_src.crs
 
         dataset = InferenceDataset(image_src=vrt_src, tile_size=1024, padding=256)
 
@@ -126,7 +127,7 @@ class DeadwoodInference:
                 minx = cropped_windows["col_off"][i]
                 maxx = minx + cropped_windows["width"][i]
                 miny = cropped_windows["row_off"][i]
-                maxy = miny + cropped_windows["width"][i]
+                maxy = miny + cropped_windows["height"][i]
 
                 # clip to positive values when writing and also to the image size
                 diff_minx = 0
@@ -191,6 +192,7 @@ class DeadwoodInference:
                 ),
                 desc="vectorizing mask",
             )
+            polygons = []
             for y in range(0, outimage.shape[0], tile_size):
                 for x in range(0, outimage.shape[1], tile_size):
                     outimage_tile = outimage[
@@ -203,12 +205,12 @@ class DeadwoodInference:
                         outimage_tile, dataset.image_src, offset_x=x, offset_y=y
                     )
 
-                    if x == 0 and y == 0:
-                        polygons = tile_polygons
-                    else:
-                        polygons.extend(tile_polygons)
+                    polygons.extend(tile_polygons)
 
                     pbar_tiles.update(1)
+
+            pbar_tiles.close()
+            polygons = merge_polygon_parts(polygons)
 
         else:
             # get polygons from mask
@@ -225,8 +227,9 @@ class DeadwoodInference:
         )
 
         # reproject the polygons back into the crs of the input tif
-        polygons = reproject_polygons(
-            polygons, dataset.image_src.crs, rasterio.open(input_tif).crs
-        )
+        with rasterio.open(input_tif) as input_src:
+            input_crs = input_src.crs
+        polygons = reproject_polygons(polygons, inference_crs, input_crs)
+        polygons = normalize_polygons(polygons)
 
         return polygons

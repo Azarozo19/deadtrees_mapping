@@ -1,15 +1,15 @@
 import json
 
-import cv2
 import geopandas as gpd
 import numpy as np
 import rasterio
 import rasterio.warp
 import shapely
 import utm
+from rasterio.enums import ColorInterp
+from rasterio.features import shapes
 from rasterio.vrt import WarpedVRT
-from shapely.affinity import affine_transform
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, shape
 from tqdm import tqdm
 
 
@@ -22,46 +22,31 @@ def get_utm_string_from_latlon(lat, lon):
     return f"EPSG:{utm_code}"
 
 
-def merge_polygons(contours, hierarchy) -> MultiPolygon:
-    # https://docs.opencv.org/4.x/d9/d8b/tutorial_py_contours_hierarchy.html
-    # hierarchy structure: [next, prev, first_child, parent]
+def _polygon_parts(geometry):
+    """Yield only polygonal parts from any Shapely geometry."""
+    if geometry is None or geometry.is_empty:
+        return
+    if isinstance(geometry, Polygon):
+        yield geometry
+    elif isinstance(geometry, (MultiPolygon, GeometryCollection)):
+        for part in geometry.geoms:
+            yield from _polygon_parts(part)
 
-    def make_valid(polygon):
-        if not polygon.is_valid:
-            polygon = polygon.buffer(0)
-        return polygon
 
-    polygons = []
+def normalize_polygons(polygons):
+    """Repair geometries and return a flat list of valid polygons."""
+    normalized = []
+    for geometry in polygons:
+        normalized.extend(_polygon_parts(shapely.make_valid(geometry)))
+    return normalized
 
-    idx = 0
-    while idx != -1:
-        # Get contour from global list of contours
-        contour = np.squeeze(contours[idx])
 
-        # cv2.findContours() sometimes returns a single point -> skip this case
-        if len(contour) > 2:
-            # Convert contour to shapely polygon
-            holes = []
-
-            # check if there is a child
-            child_idx = hierarchy[idx][2]
-            if child_idx != -1:
-                # iterate over all children and add them as holes
-                while child_idx != -1:
-                    child = np.squeeze(contours[child_idx])
-                    if len(child) > 2:
-                        holes.append(child)
-                    child_idx = hierarchy[child_idx][0]
-
-            new_poly = Polygon(shell=contour, holes=holes)
-
-            # save poly
-            polygons.append(new_poly)
-
-        # Check if there is some next polygon at the same hierarchy level
-        idx = hierarchy[idx][0]
-
-    return polygons
+def merge_polygon_parts(polygons):
+    """Dissolve touching polygon pieces, including vectorization tile seams."""
+    normalized = normalize_polygons(polygons)
+    if not normalized:
+        return []
+    return list(_polygon_parts(shapely.union_all(normalized)))
 
 
 def mask_to_polygons(mask, dataset_reader, offset_x=0, offset_y=0):
@@ -70,33 +55,26 @@ def mask_to_polygons(mask, dataset_reader, offset_x=0, offset_y=0):
     that are in the crs of the passed dataset reader
     """
 
-    contours, hierarchy = cv2.findContours(
-        mask.astype(np.uint8).copy(),
-        mode=cv2.RETR_CCOMP,
-        method=cv2.CHAIN_APPROX_SIMPLE,
-    )
-
-    # if no contours are found, return empty list
-    if hierarchy is None or len(hierarchy) == 0:
+    if not np.any(mask):
         return []
 
-    hierarchy = hierarchy[0]
-
-    poly = merge_polygons(contours, hierarchy)
-
-    # affine transform from pixel to world coordinates
-    transform = dataset_reader.transform
-    transform_matrix = (
-        transform.a,
-        transform.b,
-        transform.d,
-        transform.e,
-        transform.c + offset_x * transform.a,
-        transform.f + offset_y * transform.e,
+    # rasterio traces pixel edges, so independently vectorized tiles meet at
+    # the exact same coordinate and can be dissolved without a one-pixel gap.
+    transform = dataset_reader.window_transform(
+        rasterio.windows.Window(offset_x, offset_y, mask.shape[1], mask.shape[0])
     )
-    poly = [affine_transform(p, transform_matrix) for p in poly]
-
-    return poly
+    valid_mask = mask if mask.dtype == np.bool_ else mask.astype(bool)
+    polygon_shapes = (
+        shape(geometry)
+        for geometry, value in shapes(
+            mask.astype(np.uint8),
+            mask=valid_mask,
+            connectivity=8,
+            transform=transform,
+        )
+        if value == 1
+    )
+    return normalize_polygons(polygon_shapes)
 
 
 def save_poly(filename, poly, crs):
@@ -138,6 +116,9 @@ def image_reprojector(input_tif, min_res=0, max_res=1e9):
             resolution=target_res,
         )
 
+    # An explicit nodata value takes precedence over an alpha band in GDAL.
+    # Preserve alpha when present; otherwise preserve the source nodata value.
+    has_alpha = ColorInterp.alpha in dataset.colorinterp
     vrt = WarpedVRT(
         dataset,
         crs=utm_crs,
@@ -145,7 +126,7 @@ def image_reprojector(input_tif, min_res=0, max_res=1e9):
         width=width,
         height=height,
         dtype="uint8",
-        nodata=0,
+        nodata=None if has_alpha else dataset.nodata,
     )
 
     return vrt
@@ -166,8 +147,9 @@ def filter_polygons_by_area(polygons, min_area):
     """
     filters the polygons by the minimum area
     """
+    candidates = normalize_polygons(polygons)
     filtered = []
-    for p in tqdm(polygons, desc="filtering polygons by area"):
+    for p in tqdm(candidates, desc="filtering polygons by area"):
         exterior = p.exterior
 
         # Filter holes (interior rings) by area
@@ -176,12 +158,12 @@ def filter_polygons_by_area(polygons, min_area):
         ]
 
         # Create new polygon with filtered holes
-        filtered_p = Polygon(exterior, filtered_holes)
-
-        if filtered_p.area >= min_area:
-            filtered.append(p)
+        filtered_p = shapely.make_valid(Polygon(exterior, filtered_holes))
+        for polygon_part in _polygon_parts(filtered_p):
+            if polygon_part.area >= min_area:
+                filtered.append(polygon_part)
 
     print(
-        f"Filtered {len(polygons) - len(filtered)} polygons by minimum area of {min_area}m2."
+        f"Filtered {len(candidates) - len(filtered)} polygons by minimum area of {min_area}m2."
     )
     return filtered

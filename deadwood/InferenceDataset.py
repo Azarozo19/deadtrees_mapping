@@ -1,6 +1,7 @@
 import numpy as np
 import rasterio
 from rasterio import windows
+from rasterio.enums import ColorInterp
 from torch.utils.data import Dataset
 from torchvision.transforms import transforms
 
@@ -13,6 +14,16 @@ class InferenceDataset(Dataset):
         self.image_src = image_src
         self.width = self.image_src.width
         self.height = self.image_src.height
+        self.alpha_band = next(
+            (
+                index
+                for index, color_interp in enumerate(
+                    self.image_src.colorinterp, start=1
+                )
+                if color_interp == ColorInterp.alpha
+            ),
+            None,
+        )
 
         self.cropped_windows = [
             window
@@ -45,7 +56,12 @@ class InferenceDataset(Dataset):
             cropped_window.height + (2 * self.padding),
         )
         image = self.image_src.read((1, 2, 3), window=inference_window)
-        nodata_mask = self.image_src.dataset_mask(window=inference_window) == 255
+        if self.alpha_band is not None:
+            nodata_mask = (
+                self.image_src.read(self.alpha_band, window=inference_window) > 0
+            )
+        else:
+            nodata_mask = self.image_src.dataset_mask(window=inference_window) > 0
 
         # enable boundless reads also for VRTs by adding padding of zeros if necessary
         if image.shape[1] < self.tile_size or image.shape[2] < self.tile_size:
@@ -77,7 +93,7 @@ class InferenceDataset(Dataset):
                     (pad_left, pad_right),
                 ),
                 mode="constant",
-                constant_values=255,
+                constant_values=False,
             )
 
         # Reshape the image tensor to have 3 channels
